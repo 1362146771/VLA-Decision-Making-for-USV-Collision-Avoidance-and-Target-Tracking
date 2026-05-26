@@ -1,11 +1,5 @@
 # core/scripts/train_min.py (drop-in fixed)
 # -*- coding: utf-8 -*-
-"""
-OceanVLA 轻量训练脚本（修复版）
-- 修复 scheduler 步数：当 --max_steps=0 时，按 epochs*steps_per_epoch 计算 total_steps
-- 支持 CLIP 视觉编码器解冻和独立学习率
-- 修复参数分组，避免参数重复出现在多个组中
-"""
 
 import os
 import sys
