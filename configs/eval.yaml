@@ -1,0 +1,15 @@
+# core/configs/eval.yaml
+paths:
+  val: "data/val"
+  ckpt: "checkpoints/oceanvla_final.pt"
+
+eval:
+  batch_size: 4
+  num_workers: 4
+  img_size: 224
+  t_txt: 32
+  k_act: 6
+  h_action: 6
+  h_world: 64
+  v_act: 256
+  v_wm: 1024

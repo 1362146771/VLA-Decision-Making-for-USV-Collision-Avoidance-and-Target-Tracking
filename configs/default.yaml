@@ -1,0 +1,50 @@
+# core/configs/default.yaml  —— 建议修订版（关键改动已标注）
+paths:
+  train: "data/train"
+  val: "data/val"
+  save_dir: "checkpoints"
+
+model:
+  backbone:
+    # 改成你本地/线上可用的权重；若直连HF可写 "google/gemma-2-2b"
+    name_or_path: "/root/autodl-tmp/hf/gemma-2-2b"        # ← 把硬编码路径换成你真实可用的本地或HF名称
+    torch_dtype: "bfloat16"
+    gradient_checkpointing: true
+    freeze_layers: 0
+    device_map: null
+  temporal:
+    enabled: true       # ← 新增：是否启用时序建模
+    num_frames: 4       # ← T：每个样本取过去 T 帧（含当前帧）
+    agg: "gru"          # ← "gru" | "lstm"
+    hidden_size: 1024   # ← RNN隐藏维度（建议与 LLM hidden 对齐）
+    dropout: 0.1
+    use_prev_action: true   # ← 以 t-1 的动作作为 t 步的输入
+  vision:
+    name: "openai/clip-vit-base-patch32"
+    pool: "projected"
+    out_dim: null
+    normalize: false
+  hidden_size: 1024            # 先保持；若与你的LLM不一致，可在代码中读取backbone config自动对齐
+  # ===== 动作相关（切换为 6 类离散动作）=====
+  action_dim: 0                # 连续动作维度（离散模式下不用，可设 0 或在代码里忽略）
+  action_len: 6                # K：上下文里保留的历史动作步数（不是类别数）
+  # ===== world 相关 =====
+  world_len: 128                # N：上下文中 world token 的长度（别把 4096 直接塞进 LLM 序列）
+  vocab:
+    action: 6                  # ← 由 256 改为 6（0..5）
+    world: 8192                # ← 若你的VQ码本是8192就用它；否则改成与你离线tokenizer一致的值（如 1024）
+
+train:
+  batch_size: 4
+  epochs: 1
+  max_steps: 200
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  amp: true
+
+scheduler:
+  name: "cosine"          # cosine | linear | constant
+  warmup_steps: 1000
+  total_steps: 100000
+  cycles: 0.5

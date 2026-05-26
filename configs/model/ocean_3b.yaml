@@ -1,0 +1,24 @@
+
+backbone:
+  name_or_path: yahma/llama-7b-hf
+  hidden_size: 4096
+  freeze_layers: 0
+  gradient_checkpointing: true
+
+vision:
+  vision_model: openai/clip-vit-base-patch32
+  embed_dim: 768
+
+action:
+  input_dim: 6          # e.g., [speed, d_heading, rudder, throttle, udot, phidot]
+  chunk_size: 8
+  hidden_size: 4096
+  discrete_dim: 6       # accelerate / decelerate / forward / turn_left / turn_right /stop
+  loss_last_only: true
+
+world_model:
+  hidden_size: 4096     # used if in_dim is not set
+  latent_dim: 1024
+  lstm_hidden_size: 1024
+  seq_len: 32
+  vocab_size: 8192
