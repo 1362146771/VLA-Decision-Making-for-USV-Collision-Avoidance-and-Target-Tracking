@@ -1,50 +1,84 @@
-# core/configs/default.yaml  —— 建议修订版（关键改动已标注）
+# core/configs/default.yaml
+#
+# OceanVLA default configuration.
+#
+# Key numbers from the paper (Section 4–5):
+#   Vision encoder:   CLIP ViT-L/14, 307 M params, N=256 patch tokens, D_v=1024
+#   World model:      ≈3.45 M params, D_h=256, K=4 prediction horizon, 20 epochs
+#   Transformer policy: 12 layers, 12 heads, d=768, 85 M params, 50 epochs
+#   CLIP fine-tuning: 10 epochs on 15 K maritime image-text pairs, lr=1e-5
+#   Action space:     6 discrete maneuvers (FORWARD/STOP/TURNLEFT/TURNRIGHT/ACCEL/DECEL)
+#   Decision frequency: 2 Hz (one action every 500 ms)
+#   Dataset: 43,371 labeled frames, split 70/15/15 at episode level
+
 paths:
-  train: "data/train"
-  val: "data/val"
+  train:    "data/train"
+  val:      "data/val"
   save_dir: "checkpoints"
 
 model:
   backbone:
-    # 改成你本地/线上可用的权重；若直连HF可写 "google/gemma-2-2b"
-    name_or_path: "/root/autodl-tmp/hf/gemma-2-2b"        # ← 把硬编码路径换成你真实可用的本地或HF名称
-    torch_dtype: "bfloat16"
+    # Replace with your local checkpoint or HuggingFace model ID.
+    # Paper uses a 12-layer GPT-style transformer (85 M params, d=768).
+    name_or_path: "/root/autodl-tmp/models--google--gemma-2b"
+    torch_dtype: "bfloat16"    # Mixed-precision (FP16) training on PRO6000 (Section 4.5)
     gradient_checkpointing: true
     freeze_layers: 0
     device_map: null
+
   temporal:
-    enabled: true       # ← 新增：是否启用时序建模
-    num_frames: 4       # ← T：每个样本取过去 T 帧（含当前帧）
-    agg: "gru"          # ← "gru" | "lstm"
-    hidden_size: 1024   # ← RNN隐藏维度（建议与 LLM hidden 对齐）
+    enabled: false             # Temporal aggregation is handled by the memory bank (M=3)
+    num_frames: 3              # Memory bank size M (Section 4.4)
+    agg: "gru"
+    hidden_size: 768
     dropout: 0.1
-    use_prev_action: true   # ← 以 t-1 的动作作为 t 步的输入
+    use_prev_action: false
+
   vision:
-    name: "openai/clip-vit-base-patch32"
+    # Paper: openai/clip-vit-large-patch14 (ViT-L/14, 307 M params)
+    vision_model: "/root/autodl-tmp/models--openai--clip-vit-large-patch14"
     pool: "projected"
     out_dim: null
     normalize: false
-  hidden_size: 1024            # 先保持；若与你的LLM不一致，可在代码中读取backbone config自动对齐
-  # ===== 动作相关（切换为 6 类离散动作）=====
-  action_dim: 0                # 连续动作维度（离散模式下不用，可设 0 或在代码里忽略）
-  action_len: 6                # K：上下文里保留的历史动作步数（不是类别数）
-  # ===== world 相关 =====
-  world_len: 128                # N：上下文中 world token 的长度（别把 4096 直接塞进 LLM 序列）
+    unfreeze_layers: 12        # Unfreeze final 12/24 layers for maritime adaptation
+
+  hidden_size: 768             # d: transformer policy hidden dimension
+
+  action_dim: 0                # Continuous action dim (unused in discrete mode)
+  action_len: 6                # K: action context / chunk size
+
+  world_len: 32                # N: number of world-model context tokens in LLM sequence
+
   vocab:
-    action: 6                  # ← 由 256 改为 6（0..5）
-    world: 8192                # ← 若你的VQ码本是8192就用它；否则改成与你离线tokenizer一致的值（如 1024）
+    action: 6                  # |A| = 6 discrete maneuvers
+    world:  8192               # World model VQ vocabulary size
 
 train:
-  batch_size: 4
-  epochs: 1
-  max_steps: 200
-  lr: 1.0e-4
-  weight_decay: 1.0e-2
+  batch_size: 32               # Global batch size (32 per GPU × 4 GPUs, Section 4.5)
+  epochs: 50                   # Stage 3: 50 epochs for policy training
+  max_steps: 0                 # 0 = use epochs × steps_per_epoch
+  lr: 3.0e-4                   # AdamW learning rate (Section 4.5)
+  weight_decay: 0.01
   grad_clip: 1.0
-  amp: true
+  amp: true                    # Mixed precision (FP16)
 
 scheduler:
-  name: "cosine"          # cosine | linear | constant
+  name: "cosine"               # Cosine learning rate annealing (Section 4.5)
   warmup_steps: 1000
   total_steps: 100000
   cycles: 0.5
+
+# Three-stage training protocol (Section 4.5):
+#   Stage 1 (world_model_pretrain): 20 epochs, lr=3e-4, Adam
+#   Stage 2 (clip_finetune):        10 epochs, lr=1e-5, on 15 K maritime pairs
+#   Stage 3 (policy_train):         50 epochs, lr=3e-4, AdamW, frozen WM + fine-tuned CLIP
+stage:
+  world_model_pretrain:
+    epochs: 20
+    lr: 3.0e-4
+  clip_finetune:
+    epochs: 10
+    lr: 1.0e-5
+  policy_train:
+    epochs: 50
+    lr: 3.0e-4

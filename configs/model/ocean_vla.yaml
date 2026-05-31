@@ -1,0 +1,65 @@
+# core/configs/model/ocean_vla.yaml
+#
+# OceanVLA model architecture configuration.
+#
+# Numbers from the paper (Section 4):
+#   Vision encoder (Section 4.2):
+#     CLIP ViT-L/14, 307 M parameters
+#     24 transformer layers, D_v = 1024, N = 256 patch tokens
+#     Text encoder: 12 layers, D_t = 512, 63 M parameters
+#     Maritime adaptation: 15 K image-text pairs, τ=0.07, lr=1e-5
+#
+#   Ocean World Model (Section 4.3):
+#     CNN: 3→32→64→128→256, stride-2, 4 layers, 224×224→7×7→256 via global avg pool
+#     GRU: 2 layers, D_h = 256 (0.7 M parameters)
+#     Dynamics MLP: [D_h+D_a→512→512→D_h], D_a=64 (0.6 M parameters)
+#     Risk head: [D_h→128→1] (0.05 M parameters)
+#     Total: ≈ 3.45 M parameters
+#     Training: Adam lr=3e-4, 20 epochs, batch=64
+#     K=4 prediction steps (2–4 s at 2 Hz), λ_dyn=1.0, λ_risk=0.5
+#
+#   Transformer Policy (Section 4.4):
+#     12 layers, 12 heads, d=768, FFN dim=3072, 85 M parameters
+#     Sequence: [Z_m (3×256); Z_v (256); H_pred (4); Z_t (~32)] ≈ 1060 tokens
+#     Action head: [d→256→|A|], |A|=6
+#     Greedy decoding at 2 Hz
+
+backbone:
+  name_or_path: "/root/autodl-tmp/models--google--gemma-2b"
+  hidden_size: 768               # d: transformer hidden dimension
+  freeze_layers: 0
+  gradient_checkpointing: true
+  torch_dtype: "bfloat16"
+
+vision:
+  vision_model: "/root/autodl-tmp/models--openai--clip-vit-large-patch14"
+  pool: "projected"
+  embed_dim: 1024                # D_v: CLIP ViT-L/14 patch token dimension
+  out_dim: 768                   # Projected to transformer d
+  normalize: false
+  unfreeze_layers: 12            # Fine-tune last 12 of 24 CLIP layers (Section 4.2)
+
+action:
+  input_dim: 6                   # Discrete or continuous action input dimension
+  chunk_size: 6                  # K: number of action tokens in the sequence
+  hidden_size: 768               # Set automatically by OceanVLA.__init__
+  discrete_dim: 6                # |A| = 6 (FORWARD/STOP/TURNLEFT/TURNRIGHT/ACCEL/DECEL)
+  mlp_hidden: 256                # d' in Eq. 14
+  dropout: 0.0
+  use_class_weights: true        # Class-balanced sampling (Section 4.5)
+  use_focal: true                # Focal loss with γ=2 (Eq. 17)
+  focal_gamma: 2.0
+  label_smoothing: 0.0
+  loss_last_only: false
+
+world_model:
+  # Latent dimension D_h = 256 (Section 4.3)
+  latent_dim: 256
+  hidden_size: 768               # Set automatically by OceanVLA.__init__
+  pred_horizon: 4                # K prediction steps (2–4 s at 2 Hz)
+  seq_len: 32                    # N: number of world-model tokens in LLM sequence
+  vocab_size: 8192               # VQ codebook size
+  temperature: 1.0
+  label_smoothing: 0.0
+  lambda_dyn: 1.0                # λ_dyn in Eq. 7
+  lambda_risk: 0.5               # λ_risk in Eq. 7
