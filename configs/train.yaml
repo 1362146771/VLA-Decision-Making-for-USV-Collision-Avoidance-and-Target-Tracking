@@ -1,0 +1,46 @@
+model:
+  clip_id: openai/clip-vit-large-patch14
+  image_size: 224
+  memory_frames: 3
+  keyframe_stride: 5
+  frame_period_s: 0.1
+  prediction_steps: 4
+  world_dim: 256
+  action_embed_dim: 64
+  policy_dim: 768
+  policy_layers: 12
+  policy_heads: 12
+  policy_ffn: 3072
+  action_hidden: 256
+  max_text_length: 32
+  dropout: 0.1
+  unfreeze_vision_layers: 12
+  normalization: imagenet
+  world_arch: cnn_gru_345_v2
+  world_refinement_width: 364
+training:
+  seed: 42
+  world:
+    epochs: 20
+    lr: 0.0003
+    global_batch: 64
+    micro_batch: 8
+    weight_decay: 0.0
+    amp: true
+    balanced: false
+  clip:
+    epochs: 10
+    lr: 1.0e-05
+    global_batch: 128
+    micro_batch: 128
+    weight_decay: 0.01
+    amp: true
+    balanced: false
+  policy:
+    epochs: 50
+    lr: 0.0003
+    global_batch: 128
+    micro_batch: 4
+    weight_decay: 0.01
+    amp: true
+    balanced: true
