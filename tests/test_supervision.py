@@ -76,13 +76,19 @@ def test_caption_composition_preflight(tmp_path, cfg, public, synthetic, ready):
             else:
                 rows = []
                 for source, count in (('public',public), ('synthetic',synthetic)):
-                    n = count//3 + (index < count%3)
+                    n = count if split == 'train' else 2
                     rows.extend({'source_kind':source, 'annotation_method':'human' if source=='public' else 'programmatic',
-                                 'caption':'ship', 'caption_mirrored':'ship', 'source':source, 'license':'test'} for _ in range(n))
+                                 'caption':'ship', 'caption_mirrored':'ship', 'source':source, 'license':'test',
+                                 'episode_id':f'episodes_{split}' if source=='synthetic' else f'public_{split}',
+                                 'history':[f'{source}_{split}.png']} for _ in range(n))
             doc = {'schema':'oceanvla.dataset.v1','split':split,'dataset_hash':kind,
                    'model_config':asdict(cfg),'episodes':[f'{kind}_{split}'],
                    'assets':{},'samples':rows}
-            if kind == 'captions': doc['corpus_kind'] = 'caption_pairs'
+            if kind == 'captions':
+                doc['corpus_kind'] = 'caption_pairs'
+                doc['assets'] = {f'{src}_{split}.png': f'{src}_{split}' for src in ('public','synthetic')}
+            else:
+                doc['assets'] = {f'synthetic_{split}.png': f'synthetic_{split}'}
             (folder/f'{split}.json').write_text(json.dumps(doc))
     result = preflight(config, tmp_path/'episodes', tmp_path/'captions')
     assert result['ready'] == ready, result['errors']

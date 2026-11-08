@@ -22,14 +22,34 @@ def source_identity():
     files = {}
     for folder in ("core", "configs"):
         for p in sorted((root/folder).rglob("*")):
-            if p.is_file() and p.suffix in (".py", ".yaml"): files[p.relative_to(root).as_posix()] = sha256_file(p)
+            if p.is_file() and p.suffix in (".py", ".yaml", ".json"): files[p.relative_to(root).as_posix()] = sha256_file(p)
     return {"git_commit": git("rev-parse", "HEAD"), "git_dirty": bool(git("status", "--porcelain")),
             "source_sha256": canonical_hash(files), "source_files": files}
 
-def read_checkpoint(path):
+def read_checkpoint(path, *, config=None, clip_config=None, stage=None, provenance=None):
     path = Path(path)
     ck = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(ck, dict) and ck and all(isinstance(v, torch.Tensor) for v in ck.values()):
+        if config is not None:
+            import yaml
+            raw = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
+            cfg = ModelConfig(**raw["model"]).validate()
+            selected_stage = stage or "policy"
+            architecture = None
+            if selected_stage == "clip" or selected_stage == "policy" and cfg.encoder_kind != "none":
+                if clip_config is None:
+                    raise ValueError("clip_config")
+                architecture = json.loads(Path(clip_config).read_text(encoding="utf-8"))
+            metadata = {}
+            if provenance is not None:
+                record = json.loads(Path(provenance).read_text(encoding="utf-8"))
+                if record.get("weights_sha256") != sha256_file(path):
+                    raise ValueError("weights_sha256")
+                metadata = record["metadata"]
+            return {"format": FORMAT, "stage": selected_stage,
+                    "model_config": asdict(cfg), "clip_config": architecture,
+                    "action_schema": ACTION_SCHEMA, "action_names": ACTION_NAMES,
+                    "model_state_dict": ck, "metadata": metadata}
         sidecar = path.with_suffix(".json")
         if not sidecar.is_file():
             raise ValueError("Tensor-only checkpoint requires its matching .json sidecar")
@@ -39,12 +59,27 @@ def read_checkpoint(path):
         ck = {**doc, "format": FORMAT, "model_state_dict": ck}
     if not isinstance(ck, dict) or ck.get("format") != FORMAT:
         raise ValueError("Checkpoint is not a full versioned model. A partial policy cannot be converted into a trained full model; provide world and maritime CLIP checkpoints.")
+    if config is not None:
+        import yaml
+        raw = yaml.safe_load(Path(config).read_text(encoding="utf-8"))
+        if asdict(ModelConfig(**raw["model"]).validate()) != asdict(ModelConfig(**ck["model_config"]).validate()):
+            raise ValueError("model_config")
+    if clip_config is not None:
+        from transformers import CLIPConfig
+        supplied = CLIPConfig.from_dict(json.loads(Path(clip_config).read_text(encoding="utf-8"))).to_dict()
+        if ck["clip_config"] is None or supplied != CLIPConfig.from_dict(ck["clip_config"]).to_dict():
+            raise ValueError("clip_config")
+    if provenance is not None:
+        record = json.loads(Path(provenance).read_text(encoding="utf-8"))
+        if record.get("weights_sha256") != sha256_file(path) or record["metadata"] != ck["metadata"]:
+            raise ValueError("provenance")
     if ck.get("action_schema") != ACTION_SCHEMA or ck.get("action_names") != ACTION_NAMES: raise ValueError("Checkpoint action mapping mismatch")
     ck["model_config"] = asdict(ModelConfig(**ck["model_config"]).validate())
     return ck
 
-def restore(path, expected_stage=None):
-    ck = read_checkpoint(path)
+def restore(path, expected_stage=None, *, config=None, clip_config=None, provenance=None):
+    ck = read_checkpoint(path, config=config, clip_config=clip_config,
+                         stage=expected_stage, provenance=provenance)
     if expected_stage and ck["stage"] != expected_stage: raise ValueError(f"Expected {expected_stage} checkpoint")
     cfg = ModelConfig(**ck["model_config"])
     model = build_model(ck["stage"], cfg, hf_config=ck["clip_config"], pretrained=False)
@@ -68,11 +103,14 @@ def save_checkpoint(path, model, stage, metadata, **training_state):
     path.with_suffix(path.suffix+".sha256").write_text(f"{digest}  {path.name}\n", encoding="utf-8")
     return digest
 
-def check_tokenizer(ck, checkpoint_path):
-    directory = Path(checkpoint_path).parent / "tokenizer"
+def check_tokenizer(ck, checkpoint_path, tokenizer=None):
+    directory = Path(tokenizer) if tokenizer is not None else Path(checkpoint_path).parent / "tokenizer"
     expected = ck["metadata"].get("tokenizer_files")
-    if not expected: raise ValueError("Missing tokenizer manifest")
-    for name, digest in expected.items():
+    if not expected and tokenizer is None: raise ValueError("Missing tokenizer manifest")
+    for name in ("vocab.json", "merges.txt", "tokenizer_config.json", "special_tokens_map.json", "tokenizer.json"):
+        if not (directory/name).is_file():
+            raise FileNotFoundError(directory/name)
+    for name, digest in (expected or {}).items():
         if Path(name).name != name or sha256_file(directory/name) != digest: raise ValueError("Tokenizer integrity failure")
     return directory
 
@@ -94,8 +132,8 @@ def export_weights(path, model, stage, metadata, *, replace=False):
     state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
     if not state or not all(torch.isfinite(v).all() for v in state.values()):
         raise ValueError("Cannot export empty/nonfinite model")
-    if stage == "policy" and not all(any(k.startswith(prefix) for k in state)
-                                      for prefix in ("encoder.", "world.", "world_projection.", "policy.", "action_head.")):
+    required = ("encoder.", "policy.", "action_head.") + (("world.", "world_projection.") if model.cfg.use_world else ())
+    if stage == "policy" and not all(any(k.startswith(prefix) for k in state) for prefix in required):
         raise ValueError("Full policy export requires encoder, world, projection, policy and action head")
     torch.save(state, temp)
     digest = sha256_file(temp)

@@ -1,4 +1,5 @@
 import argparse
+import os
 import json
 from pathlib import Path
 
@@ -11,29 +12,57 @@ def main():
     q.add_argument("--config", required=True); q.add_argument("--data-root", required=True)
     q.add_argument("--episodes", required=True); q.add_argument("--output", required=True)
     q.add_argument("--split-seed", type=int, default=42)
+    q.add_argument("--paper", action="store_true")
+    q.add_argument("--partition")
+    q = sub.add_parser("prepare-collected")
+    q.add_argument("--config", required=True)
+    q.add_argument("--campaign", action="append", required=True)
+    q.add_argument("--output", required=True)
+    q.add_argument("--split-seed", type=int, default=42)
     q = sub.add_parser("prepare-clip", help="Prepare a separate licensed caption corpus")
     q.add_argument("--config", required=True); q.add_argument("--data-root", required=True)
     q.add_argument("--pairs", required=True); q.add_argument("--output", required=True)
     q.add_argument("--split-seed", type=int, default=42)
+    q.add_argument("--episode-manifests")
     q = sub.add_parser("train")
     q.add_argument("--config", required=True); q.add_argument("--stage", choices=["world","clip","policy"], required=True)
     q.add_argument("--data-root", required=True); q.add_argument("--train-manifest", required=True)
     q.add_argument("--val-manifest", required=True); q.add_argument("--output", required=True)
     q.add_argument("--device", default="cuda"); q.add_argument("--resume")
     q.add_argument("--world-checkpoint"); q.add_argument("--clip-checkpoint")
+    q.add_argument("--variant", choices=[f"row{i}" for i in range(1, 7)])
     q = sub.add_parser("evaluate")
     q.add_argument("--checkpoint", required=True); q.add_argument("--data-root", required=True)
-    q.add_argument("--manifest", required=True); q.add_argument("--output", required=True)
+    group = q.add_mutually_exclusive_group(required=True)
+    group.add_argument("--manifest")
+    group.add_argument("--dataset")
+    q.add_argument("--output", required=True)
+    q.add_argument("--config"); q.add_argument("--clip-config")
+    q.add_argument("--tokenizer"); q.add_argument("--provenance")
     q.add_argument("--device", default="cuda"); q.add_argument("--batch-size", type=int, default=4)
+    q = sub.add_parser("score-predictions")
+    q.add_argument("--manifest", required=True)
+    q.add_argument("--predictions", required=True)
+    q.add_argument("--output", required=True)
     q = sub.add_parser("inspect", help="Safe metadata plus strict architecture/state_dict load")
     q.add_argument("--checkpoint", required=True)
+    q.add_argument("--config"); q.add_argument("--clip-config")
+    q.add_argument("--stage", choices=["world", "clip", "policy"])
     q = sub.add_parser("predict", help="Offline input file; no expert targets")
-    q.add_argument("--checkpoint", required=True); q.add_argument("--request", required=True)
+    q.add_argument("--checkpoint", required=True)
+    group = q.add_mutually_exclusive_group(required=True)
+    group.add_argument("--request"); group.add_argument("--dataset")
+    q.add_argument("--config"); q.add_argument("--clip-config"); q.add_argument("--tokenizer")
+    q.add_argument("--data-root"); q.add_argument("--output")
+    q.add_argument("--split", choices=["train", "val", "test"], default="test")
+    q.add_argument("--batch-size", type=int, default=4)
     q.add_argument("--device", default="cpu")
     q = sub.add_parser("rollouts", help="Aggregate exported simulator telemetry")
     q.add_argument("--input", required=True); q.add_argument("--output", required=True)
     q.add_argument("--expected-trials", type=int, default=50)
     args = p.parse_args()
+    if args.command == "prepare" and args.paper and not args.partition:
+        p.error("--paper requires --partition")
     if args.command == "export":
         from .checkpoint import export_checkpoint
         result = {"weights_sha256": export_checkpoint(args.checkpoint, args.output), "output": args.output}
@@ -41,36 +70,53 @@ def main():
         from .config import load_config
         from .data import prepare
         cfg, _ = load_config(args.config)
-        result = prepare(args.data_root,args.episodes,args.output,cfg,args.split_seed)
+        result = prepare(args.data_root,args.episodes,args.output,cfg,args.split_seed,
+                         paper=args.paper, partition=args.partition)
     elif args.command == "prepare-clip":
         from .config import load_config
         from .data import prepare_clip
         cfg, _ = load_config(args.config)
-        result = prepare_clip(args.data_root,args.pairs,args.output,cfg,args.split_seed)
+        result = prepare_clip(args.data_root,args.pairs,args.output,cfg,args.split_seed,
+                              episode_manifests=args.episode_manifests)
+    elif args.command == "prepare-collected":
+        from .collected import prepare_collected
+        from .config import load_config
+        cfg, _ = load_config(args.config)
+        result = prepare_collected(args.campaign, args.output, cfg, args.split_seed)
     elif args.command == "train":
         from .engine import train
         result = {"output":str(train(args))}
     elif args.command == "evaluate":
         from .engine import evaluate
         result = evaluate(args)
+    elif args.command == "score-predictions":
+        from .evaluation import score_predictions
+        result = score_predictions(args.manifest, args.predictions, args.output)
     elif args.command == "inspect":
         from .checkpoint import restore
         from .model import parameter_counts
         from .config import sha256_file
-        model, ck = restore(args.checkpoint)
+        model, ck = restore(args.checkpoint, args.stage, config=args.config, clip_config=args.clip_config)
         result = {"stage":ck["stage"],"config":ck["model_config"],"parameters":parameter_counts(model),
+                  "prediction_horizon_s": model.cfg.prediction_horizon_s,
                   "sha256":sha256_file(args.checkpoint),"metadata":ck["metadata"],
                   "missing_keys":0,"unexpected_keys":0,"shape_mismatch":0}
+    elif args.command == "predict" and args.dataset:
+        from .inference import predict_dataset
+        if not args.output or not args.data_root:
+            p.error("--output --data-root")
+        result = predict_dataset(args)
     elif args.command == "predict":
         from .inference import LivePolicy
         request = json.loads(Path(args.request).read_text(encoding="utf-8"))
-        policy = LivePolicy(args.checkpoint,args.device)
+        policy = LivePolicy(args.checkpoint, args.device, config=args.config, clip_config=args.clip_config, tokenizer=args.tokenizer)
         for frame in request["frames"]:
             policy.push_frame(Path(args.request).parent/frame["image"],frame["timestamp_s"])
-        result = policy.decide(request["instruction"],request["last_executed_action"])
+        result = policy.decide(request["instruction"], request["last_executed_action"], task=request.get("task"))
     else:
         from .rollouts import summarize_rollouts
         result = summarize_rollouts(args.input,args.output,args.expected_trials)
-    print(json.dumps(result,ensure_ascii=False,indent=2))
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(json.dumps(result,ensure_ascii=False,indent=2))
 
 if __name__ == "__main__": main()

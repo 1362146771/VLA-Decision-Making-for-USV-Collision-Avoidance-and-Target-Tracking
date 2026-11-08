@@ -62,6 +62,8 @@ class OceanWorldModel(nn.Module):
         sampling interval. Risk is collision within five seconds after anchor.
         """
         m, k = self.cfg.memory_frames, self.cfg.prediction_steps
+        if m < 1:
+            raise ValueError("World pretraining requires a preceding keyframe")
         if images.shape[1] != m+1+k or expert_actions.shape != images.shape[:2]:
             raise ValueError("World sequence/actions not aligned")
         h, _ = self.encode(images)
@@ -99,11 +101,11 @@ class MaritimeCLIP(nn.Module):
         self.visual_dim, self.text_dim = vc.hidden_size, tc.hidden_size
         self.configure_trainable()
 
-    def configure_trainable(self):
+    def configure_trainable(self, vision_layers=None):
         # Both text tower and image projection train; only last N visual blocks.
         self.clip.requires_grad_(True)
         self.clip.vision_model.requires_grad_(False)
-        n = self.cfg.unfreeze_vision_layers
+        n = self.cfg.unfreeze_vision_layers if vision_layers is None else vision_layers
         if n < 0 or n > len(self.clip.vision_model.encoder.layers):
             raise ValueError("Invalid number of CLIP visual layers to unfreeze")
         if n:
@@ -117,7 +119,13 @@ class MaritimeCLIP(nn.Module):
         text = self.clip.text_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         return visual, text
 
-    def forward(self, images, input_ids, attention_mask):
+    def forward(self, images, input_ids, attention_mask, distributed=False):
+        if distributed:
+            from .distributed import contrastive_loss
+            result = self.clip(pixel_values=images, input_ids=input_ids,
+                               attention_mask=attention_mask, return_loss=False)
+            return contrastive_loss(result.image_embeds, result.text_embeds,
+                                    self.clip.logit_scale, distributed=True)
         # CLIP logit_scale is trainable, initialized by pretrained CLIP.
         result = self.clip(pixel_values=images, input_ids=input_ids,
                            attention_mask=attention_mask, return_loss=True)
@@ -129,19 +137,39 @@ def focal_loss(logits, targets, gamma=2.0):
     pt = (-ce).exp()  # deliberately differentiable
     return ((1-pt).pow(gamma)*ce).mean()
 
+class PatchTextEncoder(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        patch_size = max(1, cfg.image_size // 16)
+        self.patch_count = (cfg.image_size // patch_size) ** 2
+        self.visual_dim = self.text_dim = cfg.policy_dim
+        self.vision = nn.Conv2d(3, self.visual_dim, patch_size, stride=patch_size)
+        self.language = nn.Embedding(49408, self.text_dim)
+
+    def tokens(self, images, input_ids, attention_mask):
+        b, t, c, h, w = images.shape
+        tokens = self.vision(images.reshape(b*t, c, h, w)).flatten(2).transpose(1, 2)
+        return tokens.reshape(b, t*self.patch_count, self.visual_dim), self.language(input_ids)
+
 class OceanVLA(nn.Module):
     def __init__(self, cfg, *, encoder=None, world=None, hf_config=None, pretrained=True):
         super().__init__()
         self.cfg = cfg.validate()
-        self.encoder = encoder if encoder is not None else MaritimeCLIP(cfg, hf_config=hf_config, pretrained=pretrained)
-        self.world = world if world is not None else OceanWorldModel(cfg)
-        self.world.requires_grad_(False)
-        self.world.eval()
+        self.encoder = encoder if encoder is not None else (
+            PatchTextEncoder(cfg) if cfg.encoder_kind == "none"
+            else MaritimeCLIP(cfg, hf_config=hf_config, pretrained=pretrained))
+        if cfg.freeze_policy_clip:
+            self.encoder.requires_grad_(False).eval()
+        elif cfg.encoder_kind != "none" and cfg.policy_clip_mode == "finetune":
+            self.encoder.configure_trainable(cfg.unfreeze_vision_layers)
+        self.world = (world if world is not None else OceanWorldModel(cfg)) if cfg.use_world else None
+        if self.world is not None:
+            self.world.requires_grad_(False).eval()
         d = cfg.policy_dim
         self.visual_projection = nn.Linear(self.encoder.visual_dim, d)
         self.text_projection = nn.Linear(self.encoder.text_dim, d)
-        self.world_projection = nn.Linear(cfg.world_dim, d)
-        count = (cfg.memory_frames+1)*self.encoder.patch_count + cfg.prediction_steps + cfg.max_text_length + 1
+        self.world_projection = nn.Linear(cfg.world_dim, d) if cfg.use_world else None
+        count = (cfg.observation_memory_frames+1)*self.encoder.patch_count + (cfg.prediction_steps if cfg.use_world else 0) + cfg.max_text_length + 1
         self.position = nn.Parameter(torch.randn(1, count, d)*0.02)
         self.action_token = nn.Parameter(torch.randn(1, 1, d)*0.02)
         layer = nn.TransformerEncoderLayer(d, cfg.policy_heads, cfg.policy_ffn,
@@ -158,7 +186,10 @@ class OceanVLA(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.world.eval()
+        if self.world is not None:
+            self.world.eval()
+        if self.cfg.freeze_policy_clip:
+            self.encoder.eval()
         return self
 
     def forward(self, images, input_ids, attention_mask, last_action):
@@ -167,21 +198,28 @@ class OceanVLA(nn.Module):
         The world GRU is warmed on this exact history window in train/eval/live,
         so no hidden recurrent state from a different episode can leak in.
         """
-        if images.shape[1] != self.cfg.memory_frames+1: raise ValueError("Need M history frames plus current image")
+        if images.shape[1] != self.cfg.observation_memory_frames+1:
+            raise ValueError("Incorrect observation history length")
         if input_ids.shape[1] != self.cfg.max_text_length: raise ValueError("Use fixed padded CLIP context")
         if last_action.dtype != torch.long or last_action.shape != (images.shape[0],): raise ValueError("last_action must be [B] int64")
-        visual, text = self.encoder.tokens(images, input_ids, attention_mask)
-        with torch.no_grad():
-            latents, _ = self.world.encode(images)
-            future = self.world.rollout(latents[:, -1], last_action)
+        visual_images = images[:, -(self.cfg.memory_frames+1):]
+        visual, text = self.encoder.tokens(visual_images, input_ids, attention_mask)
         b = images.shape[0]
         visual = visual.reshape(b, self.cfg.memory_frames+1, self.encoder.patch_count, -1)
         memory = self.visual_projection(visual[:, :-1]).flatten(1, 2)
         current = self.visual_projection(visual[:, -1])
-        tokens = torch.cat([memory, current, self.world_projection(future),
+        prefix_tokens = [memory, current]
+        if self.world is not None:
+            with torch.no_grad():
+                world_images = images[:, -(self.cfg.policy_world_memory_frames+1):]
+                latents, _ = self.world.encode(world_images)
+                future = self.world.rollout(latents[:, -1], last_action)
+            prefix_tokens.append(self.world_projection(future))
+        tokens = torch.cat([*prefix_tokens,
                             self.text_projection(text), self.action_token.expand(b, -1, -1)], 1)
-        tokens = tokens + self.position[:, :tokens.shape[1]]
-        prefix = memory.shape[1] + current.shape[1] + future.shape[1]
+        offset = (self.cfg.observation_memory_frames - self.cfg.memory_frames) * self.encoder.patch_count
+        tokens = tokens + self.position[:, offset:offset+tokens.shape[1]]
+        prefix = sum(t.shape[1] for t in prefix_tokens)
         padding = torch.cat([torch.zeros(b, prefix, dtype=torch.bool, device=images.device),
                              ~attention_mask.bool(), torch.zeros(b, 1, dtype=torch.bool, device=images.device)], 1)
         hidden = self.policy(tokens, src_key_padding_mask=padding, is_causal=False)
@@ -194,7 +232,8 @@ def build_model(stage, cfg, *, hf_config=None, pretrained=True):
     raise ValueError(stage)
 
 def clip_config_of(model):
-    if isinstance(model, OceanVLA): return model.encoder.clip.config.to_dict()
+    if isinstance(model, OceanVLA):
+        return model.encoder.clip.config.to_dict() if model.cfg.encoder_kind != "none" else None
     if isinstance(model, MaritimeCLIP): return model.clip.config.to_dict()
     return None
 

@@ -11,6 +11,15 @@ def reject_proxy_fields(record):
     if PROXY_FIELDS.intersection(record):
         raise ValueError("Recorded expert actions and collision events are required")
 
+def flip_allowed(record):
+    return (record.get("allow_horizontal_flip") is True
+            and record.get("dynamic_encounter", False) is False
+            and record.get("encounter_type") in (None, "none")
+            and record.get("asymmetric_give_way", False) is False
+            and (record.get("task") == "tracking"
+                 or record.get("scene_type") == "static_obstacle"
+                 and record.get("laterally_symmetric") is True))
+
 
 def validate_caption(record):
     reject_proxy_fields(record)
@@ -19,7 +28,10 @@ def validate_caption(record):
         raise ValueError("Caption source_kind must be public or synthetic")
     if record.get("annotation_method") != CAPTION_METHODS[source_kind]:
         raise ValueError("Public captions require human annotation; synthetic captions require programmatic annotation")
-    for key in ("caption", "caption_mirrored", "source", "license"):
+    keys = ("caption", "source", "license")
+    if flip_allowed(record):
+        keys += ("caption_mirrored",)
+    for key in keys:
         if not isinstance(record.get(key), str) or not record[key].strip():
             raise ValueError(f"Missing caption field {key}")
 

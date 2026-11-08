@@ -1,0 +1,35 @@
+{
+  "model_type": "clip",
+  "projection_dim": 768,
+  "logit_scale_init_value": 2.6592,
+  "text_config": {
+    "model_type": "clip_text_model",
+    "vocab_size": 49408,
+    "hidden_size": 768,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 12,
+    "max_position_embeddings": 77,
+    "projection_dim": 768,
+    "hidden_act": "quick_gelu",
+    "layer_norm_eps": 1e-05,
+    "attention_dropout": 0.0,
+    "bos_token_id": 49406,
+    "eos_token_id": 49407,
+    "pad_token_id": 1
+  },
+  "vision_config": {
+    "model_type": "clip_vision_model",
+    "hidden_size": 1024,
+    "intermediate_size": 4096,
+    "num_hidden_layers": 24,
+    "num_attention_heads": 16,
+    "image_size": 224,
+    "patch_size": 14,
+    "num_channels": 3,
+    "projection_dim": 768,
+    "hidden_act": "quick_gelu",
+    "layer_norm_eps": 1e-05,
+    "attention_dropout": 0.0
+  }
+}

@@ -25,6 +25,33 @@ class ModelConfig:
     dropout: float = 0.1
     unfreeze_vision_layers: int = 12
     normalization: str = "imagenet"
+    encoder_kind: str = "maritime"
+    use_world: bool = True
+    prompt_mode: str = "task"
+    policy_loss: str = "focal"
+    world_memory_frames: int | None = None
+    policy_clip_mode: str = "legacy"
+
+    @property
+    def policy_world_memory_frames(self):
+        if not self.use_world:
+            return 0
+        return self.memory_frames if self.world_memory_frames is None else self.world_memory_frames
+
+    @property
+    def observation_memory_frames(self):
+        return max(self.memory_frames, self.policy_world_memory_frames)
+
+    @property
+    def freeze_policy_clip(self):
+        return self.encoder_kind != "none" and (
+            self.policy_clip_mode == "frozen"
+            or self.policy_clip_mode == "legacy" and self.encoder_kind == "generic"
+        )
+
+    @property
+    def prediction_horizon_s(self):
+        return self.frame_period_s * self.keyframe_stride * self.prediction_steps
 
     def validate(self):
         if self.world_arch not in ("cnn_gru_v1", "cnn_gru_345_v2"):
@@ -32,15 +59,31 @@ class ModelConfig:
         if self.world_refinement_width < 1:
             raise ValueError("Invalid spatial refinement width")
         if self.normalization != "imagenet": raise ValueError("This revision pins ImageNet normalization; do not silently change it")
-        if self.image_size < 16 or self.memory_frames < 1 or self.keyframe_stride < 1: raise ValueError("Invalid image/history settings")
+        if self.image_size < 16 or self.memory_frames < 0 or self.keyframe_stride < 1: raise ValueError("Invalid image/history settings")
+        if self.encoder_kind not in ("maritime", "generic", "none") or type(self.use_world) is not bool:
+            raise ValueError("Invalid policy components")
+        if self.world_memory_frames is not None and (
+                type(self.world_memory_frames) is not int or self.world_memory_frames < 0):
+            raise ValueError("Invalid world history length")
+        if self.policy_clip_mode not in ("legacy", "frozen", "finetune"):
+            raise ValueError("Invalid policy CLIP training mode")
+        if self.prompt_mode not in ("minimal", "minimal_task", "task") or self.policy_loss not in ("cross_entropy", "focal"):
+            raise ValueError("Invalid policy prompt or loss")
         if self.world_dim < 1 or self.prediction_steps < 1 or self.frame_period_s <= 0: raise ValueError("Invalid world/time settings")
         if self.policy_dim % self.policy_heads or self.policy_layers < 1: raise ValueError("Invalid transformer dimensions")
         if self.max_text_length < 2 or not 0 <= self.dropout < 1: raise ValueError("Invalid text/dropout settings")
         return self
 
-def load_config(path):
+def load_config(path, variant=None):
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or set(raw) != {"model", "training"}: raise ValueError("Config needs model and training sections only")
+    if variant is not None:
+        presets = yaml.safe_load((Path(__file__).resolve().parents[1]/"configs/ablations.yaml").read_text(encoding="utf-8"))
+        if variant not in presets:
+            raise ValueError("Unknown ablation row")
+        settings = presets[variant]
+        raw["model"].update(settings["model"])
+        raw["training"]["policy"]["balanced"] = settings["balanced"]
     cfg = ModelConfig(**raw["model"]).validate()
     train = raw["training"]
     required = {"seed", "world", "clip", "policy"}
@@ -48,7 +91,10 @@ def load_config(path):
     for stage in ("world", "clip", "policy"):
         s = train[stage]
         keys = {"epochs", "lr", "global_batch", "micro_batch", "weight_decay", "amp", "balanced"}
-        if set(s) != keys: raise ValueError(f"Unknown/missing {stage} training fields")
+        if set(s) - keys - ({"patience"} if stage == "policy" else set()) or keys - set(s):
+            raise ValueError(f"Unknown/missing {stage} training fields")
+        if "patience" in s and (type(s["patience"]) is not int or s["patience"] < 1):
+            raise ValueError("patience")
         if min(s["epochs"], s["global_batch"], s["micro_batch"], s["lr"]) <= 0: raise ValueError("Positive training settings required")
         if s["global_batch"] % s["micro_batch"]: raise ValueError("global_batch must be a multiple of micro_batch")
         if s["balanced"] and stage != "policy": raise ValueError("Class balancing is supported only for the policy stage")

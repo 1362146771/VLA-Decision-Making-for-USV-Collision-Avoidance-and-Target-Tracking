@@ -25,7 +25,7 @@ class ActionExecutor:
 
     Accept a new discrete action at decision rate (2 Hz). Incremental speed
     actions are applied once per decision, not on every control tick.
-    Radar override is separate from the neural policy and bypasses smoothing.
+    Proactive radar braking uses EMA; an emergency stop bypasses it.
     This is a simulator adapter, not a safety-certified controller.
     """
     def __init__(self, alpha=0.3):
@@ -49,14 +49,20 @@ class ActionExecutor:
         if radar_enabled:
             if radar_distance_m is None or not math.isfinite(radar_distance_m) or radar_distance_m < 0:
                 raise ValueError("Radar-assisted mode requires valid simulator range")
-            if proactive_m < emergency_m or emergency_m <= 0: raise ValueError("Invalid radar thresholds")
+            if not (math.isfinite(proactive_m) and math.isfinite(emergency_m)
+                    and 0 < emergency_m < proactive_m):
+                raise ValueError("Invalid radar thresholds")
         fail_safe = not inside_geofence or seconds_since_action >= 1.0
-        radar_stop = radar_enabled and radar_distance_m < proactive_m
-        if fail_safe or radar_stop:
+        if fail_safe:
             self.smooth_throttle = 0.0
-            return {"throttle": 0.0, "rudder_deg": self.smooth_rudder,
-                    "override": "failsafe" if fail_safe else "radar"}
+            return {"throttle": 0.0, "rudder_deg": self.smooth_rudder, "override": "failsafe"}
+        if radar_enabled and radar_distance_m <= emergency_m:
+            self.smooth_throttle = self.smooth_rudder = 0.0
+            return {"throttle": 0.0, "rudder_deg": 0.0, "override": "radar_emergency"}
+        proactive = radar_enabled and radar_distance_m <= proactive_m
         a = self.alpha
-        self.smooth_throttle = a*self.throttle + (1-a)*self.smooth_throttle
+        target_throttle = 0.0 if proactive else self.throttle
+        self.smooth_throttle = a*target_throttle + (1-a)*self.smooth_throttle
         self.smooth_rudder = a*self.rudder + (1-a)*self.smooth_rudder
-        return {"throttle": self.smooth_throttle, "rudder_deg": self.smooth_rudder, "override": None}
+        return {"throttle": self.smooth_throttle, "rudder_deg": self.smooth_rudder,
+                "override": "radar_proactive" if proactive else None}

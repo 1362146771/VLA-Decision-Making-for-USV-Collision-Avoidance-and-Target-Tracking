@@ -68,6 +68,8 @@ def summarize_rollouts(path, output, expected_trials=50):
             compliant = sum(x["give_way_compliant"] for x in items)
             r.update(give_way_compliance=compliant/n, give_way_ci95=wilson(compliant,n),
                      avg_rule_violations=sum(x["rule_violations"] for x in items)/n)
+        r["ci95_percent"] = {key[:-5]: [round(100*x, 2) for x in value]
+                             for key, value in r.items() if key.endswith("_ci95")}
         result.append(r)
     if not result: raise ValueError("No trials")
     output = Path(output)

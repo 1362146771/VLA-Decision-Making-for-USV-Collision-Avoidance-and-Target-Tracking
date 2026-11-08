@@ -68,7 +68,7 @@ def test_old_weak_checkpoint_not_upgraded_by_metadata(tmp_path):
         restore(path)
 
 
-def test_effective_batch_balancing_and_reproducibility():
+def test_inverse_frequency_sampling_and_reproducibility():
     rows = [{"target": c} for c in range(6) for _ in range(c+1)]
     class Data:
         def __len__(self): return 1001
@@ -76,9 +76,13 @@ def test_effective_batch_balancing_and_reproducibility():
     sampler = EpochSampler(ds, seed=7, balanced=True, batch_size=128)
     indices = list(sampler)
     assert indices == list(sampler)
-    for offset in range(0, len(indices), 128):
-        counts = [sum(rows[i]["target"] == c for i in indices[offset:offset+128]) for c in range(6)]
-        assert max(counts)-min(counts) <= 1
+    assert len(indices) == len(ds)
+    assert sampler.weights == [1 / (r["target"] + 1) for r in rows]
+    assert len(set(indices)) < len(indices)
+    counts = [sum(rows[i]["target"] == c for i in indices) for c in range(6)]
+    assert all(100 < count < 240 for count in counts)
+    first = [sum(rows[i]["target"] == c for i in indices[:128]) for c in range(6)]
+    assert max(first) - min(first) > 1
     sampler.epoch += 1
     assert indices != list(sampler)
 

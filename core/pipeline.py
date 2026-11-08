@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 from .config import load_config, sha256_file
-from .supervision import CAPTION_COUNTS, validate_caption, validate_episode_sample
+from .supervision import CAPTION_COUNTS, flip_allowed, validate_caption, validate_episode_sample
 
 
 def preflight(config, episode_dir, caption_dir):
@@ -43,14 +43,15 @@ def preflight(config, episode_dir, caption_dir):
                         "prediction_steps", "max_text_length", "normalization"):
                 if doc.get("model_config", {}).get(key) != getattr(cfg, key):
                     errors.append(f"{name}: incompatible preprocessing/time field {key}")
-            if not rows:
+            if not rows and (kind != "captions" or split != "test"):
                 errors.append(f"{name}: empty dataset")
             for row in rows:
                 try:
                     if kind == "episodes": validate_episode_sample(row, cfg)
                     else:
                         validate_caption(row)
-                        caption_counts[row["source_kind"]] += 1
+                        if split == "train":
+                            caption_counts[row["source_kind"]] += 1
                 except (ValueError, TypeError) as exc:
                     errors.append(f"{name}: {exc}")
                     break
@@ -69,19 +70,22 @@ def preflight(config, episode_dir, caption_dir):
                 if split == "train":
                     if not all(counts):
                         errors.append(f"{name}: six-action balancing requires every class, including STOP")
-                    if any(not r.get("instruction_mirrored") for r in rows):
+                    if any(flip_allowed(r) and not r.get("instruction_mirrored") for r in rows):
                         errors.append(f"{name}: mirrored instruction required for directional augmentation")
                     if len(world) < training["world"]["global_batch"] or len(rows) < training["policy"]["global_batch"]:
                         errors.append(f"{name}: fewer samples than a global batch")
                 elif not all(counts):
                     warnings.append(f"{name}: some actions absent; report class support and undefined recall")
             else:
+                item["synthetic_episode_ids"] = {r["episode_id"] for r in rows if r.get("source_kind") == "synthetic"}
+                item["synthetic_assets"] = [(r["episode_id"], doc["assets"].get(r["history"][-1]))
+                                            for r in rows if r.get("source_kind") == "synthetic"]
                 if doc.get("corpus_kind") != "caption_pairs":
                     errors.append(f"{name}: requires separate maritime image-text corpus")
                 if any(not r.get("caption") for r in rows):
                     errors.append(f"{name}: missing maritime caption")
                 if split == "train":
-                    if any(not r.get("caption_mirrored") for r in rows):
+                    if any(flip_allowed(r) and not r.get("caption_mirrored") for r in rows):
                         errors.append(f"{name}: mirrored captions required")
                     if len(rows) < training["clip"]["global_batch"]:
                         errors.append(f"{name}: insufficient examples for contrastive batch")
@@ -97,6 +101,12 @@ def preflight(config, episode_dir, caption_dir):
                     if set(docs[i]["assets"].values()) & set(docs[j]["assets"].values()):
                         errors.append(f"{kind}: identical image content across splits")
     caption_train = manifests.get("captions/train", {})
+    episode_train = manifests.get("episodes/train", {})
+    if set(caption_train.get("synthetic_episode_ids", [])) - set(episode_train.get("episodes", [])):
+        errors.append("Synthetic CLIP training requires training episodes")
+    train_assets = set(episode_train.get("assets", {}).values())
+    if any(digest not in train_assets for _, digest in caption_train.get("synthetic_assets", [])):
+        errors.append("Synthetic CLIP training image absent from episode training assets")
     for split in ("val", "test"):
         ep = manifests.get(f"episodes/{split}", {})
         if set(caption_train.get("episodes", [])) & set(ep.get("episodes", [])) or set(caption_train.get("assets", {}).values()) & set(ep.get("assets", {}).values()):
@@ -104,7 +114,7 @@ def preflight(config, episode_dir, caption_dir):
     for kind, expected in CAPTION_COUNTS.items():
         if caption_counts[kind] != expected:
             errors.append(f"Expected {expected} {kind} caption pairs; found {caption_counts[kind]}")
-    summaries = {k: {a:b for a,b in v.items() if a not in ("assets", "episodes")} for k,v in manifests.items()}
+    summaries = {k: {a:b for a,b in v.items() if a not in ("assets", "episodes", "synthetic_episode_ids", "synthetic_assets")} for k,v in manifests.items()}
     return {"ready": not errors, "errors": errors, "warnings": warnings, "manifests": summaries,
             "input_sha256": hashes, "model_config": asdict(cfg), "training": training,
             "data_policy": "read_only", "world_architecture": cfg.world_arch,
@@ -120,9 +130,20 @@ def main():
     p.add_argument("--caption-root")
     p.add_argument("--output", required=True)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--nproc-per-node", type=int, default=1)
     p.add_argument("--check-only", action="store_true")
     p.add_argument("--report")
     a = p.parse_args()
+    if a.nproc_per_node < 1:
+        p.error("--nproc-per-node must be positive")
+    _, training = load_config(a.config)
+    for stage in ("world", "clip", "policy"):
+        options = training[stage]
+        forward_batch = options["micro_batch"] * a.nproc_per_node
+        if options["global_batch"] % forward_batch:
+            p.error(f"{stage}: global_batch must be divisible by micro_batch * nproc_per_node")
+        if stage == "clip" and options["global_batch"] != forward_batch:
+            p.error("clip: global_batch must equal micro_batch * nproc_per_node")
     result = preflight(a.config, a.episodes, a.captions)
     if a.report:
         report = Path(a.report)
@@ -138,6 +159,10 @@ def main():
         return 2
     if a.check_only:
         return 0
+    if a.nproc_per_node > 1 and a.device.startswith("cuda"):
+        import torch
+        if torch.cuda.device_count() < a.nproc_per_node or not torch.distributed.is_nccl_available():
+            raise ValueError("CUDA DDP requires sufficient visible GPUs and NCCL")
     output = Path(a.output).resolve()
     roots = [Path(x).resolve() for x in (a.episodes, a.captions, a.data_root, a.caption_root or a.data_root)]
     if any(output.is_relative_to(root) for root in roots):
@@ -147,7 +172,11 @@ def main():
     output.mkdir(parents=True)
     (output/"preflight.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     def run(*args):
-        subprocess.run([sys.executable, "-m", "core.cli", *map(str, args)], check=True)
+        prefix = [sys.executable, "-m", "core.cli"]
+        if args[0] == "train" and a.nproc_per_node > 1:
+            prefix = [sys.executable, "-m", "torch.distributed.run", "--standalone",
+                      "--nproc_per_node", str(a.nproc_per_node), "-m", "core.cli"]
+        subprocess.run([*prefix, *map(str, args)], check=True)
     for stage in ("world", "clip", "policy"):
         folder = Path(a.captions if stage == "clip" else a.episodes)
         root = a.caption_root or a.data_root if stage == "clip" else a.data_root

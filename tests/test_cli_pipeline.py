@@ -76,6 +76,47 @@ def test_complete_cli_training_evaluation_and_resume(tmp_path,cfg,hf_config):
         'last_executed_action':row['last_action'],'frames':[{'image':row['history'][-1],'timestamp_s':0.}]}))
     prediction=json.loads(run('predict','--checkpoint',policy,'--request',req))
     assert prediction['action_id'] in range(6)
+    from core.config import sha256_file, canonical_hash
+    _, policy_record = restore(policy, "policy")
+    architecture = tmp_path/"architecture.json"
+    architecture.write_text(json.dumps(policy_record["clip_config"]))
+    provenance = tmp_path/"provenance.json"
+    provenance.write_text(json.dumps({"weights_sha256": sha256_file(policy), "metadata": policy_record["metadata"]}))
+    partition = json.loads((split/"partition.json").read_text())
+    documents = {name: json.loads((split/(name+".json")).read_text()) for name in ("train", "val", "test")}
+    index = {"schema": "oceanvla.dataset_index.v1", "partition": "partition.json",
+             "partition_sha256": canonical_hash(partition), "partition_file_sha256": sha256_file(split/"partition.json"),
+             "episode_count": sum(len(d["episodes"]) for d in documents.values()),
+             "frame_count": sum(sum(e["raw_frames"] for e in d["decision_support"].values()) for d in documents.values()),
+             "usable_windows": sum(len(d["samples"]) for d in documents.values()), "splits": {}}
+    for name, doc in documents.items():
+        index["splits"][name] = {"manifest": name+".json", "manifest_sha256": sha256_file(split/(name+".json")),
+                                 "decision_support_sha256": doc["decision_support_sha256"], "episodes": len(doc["episodes"]),
+                                 "raw_frames": sum(e["raw_frames"] for e in doc["decision_support"].values()),
+                                 "usable_windows": len(doc["samples"])}
+    dataset = split/"dataset.json"
+    dataset.write_text(json.dumps(index))
+    pure = tmp_path/"weights.pt"
+    torch.save(torch.load(policy, weights_only=True), pure)
+    provenance.write_text(json.dumps({"weights_sha256": sha256_file(pure), "metadata": policy_record["metadata"]}))
+    options = ["--checkpoint", pure, "--config", config, "--clip-config", architecture,
+               "--tokenizer", tmp_path/"policy/tokenizer", "--device", "cpu"]
+    new_prediction = json.loads(run("predict", *options, "--request", req))
+    assert prediction == new_prediction
+    run("predict", *options, "--dataset", dataset, "--data-root", tmp_path, "--output", tmp_path/"predictions.json")
+    predicted = json.loads((tmp_path/"predictions.json").read_text())
+    assert [r["top3"] for r in predicted["predictions"]] == [r["top3"] for r in ev["predictions"]]
+    run("evaluate", *options, "--dataset", dataset, "--data-root", tmp_path,
+        "--provenance", provenance, "--output", tmp_path/"indexed_metrics.json", "--batch-size", "3")
+    indexed = json.loads((tmp_path/"indexed_metrics.json").read_text())
+    assert indexed["top1"] == ev["top1"]
+    assert indexed["predictions"] == ev["predictions"]
+    failed = subprocess.run([sys.executable, "-m", "core.cli", "evaluate", *map(str, options),
+                             "--dataset", str(dataset), "--data-root", str(tmp_path),
+                             "--output", str(tmp_path/"missing.json")], capture_output=True)
+    assert failed.returncode != 0 and b"evaluation_provenance" in failed.stderr
+    assert not (tmp_path/"missing.json").exists()
+
     # Completed checkpoints cannot accidentally restart or overwrite a run.
     result=subprocess.run([sys.executable,'-m','core.cli','train','--stage','world',*map(str,common),
                            '--resume',str(world),'--output',str(tmp_path/'resume')],capture_output=True)

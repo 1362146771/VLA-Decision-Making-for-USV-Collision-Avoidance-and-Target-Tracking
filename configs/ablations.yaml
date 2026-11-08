@@ -1,0 +1,6 @@
+row1: {model: {encoder_kind: none, use_world: false, prompt_mode: minimal_task, memory_frames: 0, policy_loss: cross_entropy}, balanced: false}
+row2: {model: {encoder_kind: generic, use_world: false, prompt_mode: minimal_task, memory_frames: 0, policy_clip_mode: finetune, policy_loss: focal}, balanced: true}
+row3: {model: {encoder_kind: generic, use_world: true, prompt_mode: minimal_task, memory_frames: 0, world_memory_frames: 3, policy_clip_mode: finetune, policy_loss: focal}, balanced: true}
+row4: {model: {encoder_kind: maritime, use_world: true, prompt_mode: minimal_task, memory_frames: 0, world_memory_frames: 3, policy_clip_mode: finetune, policy_loss: focal}, balanced: true}
+row5: {model: {encoder_kind: maritime, use_world: true, prompt_mode: task, memory_frames: 0, world_memory_frames: 3, policy_clip_mode: finetune, policy_loss: focal}, balanced: true}
+row6: {model: {encoder_kind: maritime, use_world: true, prompt_mode: task, memory_frames: 3, world_memory_frames: 3, policy_clip_mode: finetune, policy_loss: focal}, balanced: true}

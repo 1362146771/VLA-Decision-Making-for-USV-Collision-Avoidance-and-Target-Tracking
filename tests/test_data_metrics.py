@@ -40,7 +40,9 @@ def test_prepare_split_temporal_alignment_and_integrity(tmp_path,cfg):
     indices=[int(x.split('/')[-1].split('.')[0]) for x in r['world_images']]
     assert np.diff(indices).tolist()==[cfg.keyframe_stride]*7
     policy=EpisodeDataset(tmp_path,output/'test.json',cfg,'policy',Tokenizer())
-    assert policy[0]['last_action']==1
+    assert policy.rows[0]['frame_index']==cfg.memory_frames*cfg.keyframe_stride
+    assert policy[0]['last_action']==policy.rows[0]['last_action']==2
+    assert policy.rows[-1]['frame_index']+cfg.prediction_steps*cfg.keyframe_stride < 32
     assert len(policy)==summary['test']['policy_samples']
     with pytest.raises(ValueError): EpisodeDataset(tmp_path,output/'test.json',cfg,'policy',Tokenizer(),augment=True)
     with pytest.raises(FileExistsError): prepare(tmp_path,raw,output,cfg)
@@ -68,9 +70,21 @@ def test_action_decode_and_increment_rate():
     e.accept(4)
     for _ in range(5): e.update()
     assert e.throttle==.1
-    assert e.update(radar_enabled=True,radar_distance_m=25)['throttle']==0
+    assert 0 < e.update(radar_enabled=True,radar_distance_m=25)['throttle'] < e.throttle
     with pytest.raises(ValueError): e.accept(99)
     with pytest.raises(ValueError): e.update(radar_enabled=True)
+
+def test_two_tier_radar_brakes_then_stops():
+    executor = ActionExecutor()
+    executor.accept(3)
+    normal = executor.update(radar_enabled=True, radar_distance_m=31)
+    proactive = executor.update(radar_enabled=True, radar_distance_m=30)
+    assert proactive["override"] == "radar_proactive"
+    assert proactive["throttle"] == pytest.approx(normal["throttle"] * (1 - executor.alpha))
+    assert proactive["rudder_deg"] > normal["rudder_deg"]
+    emergency = executor.update(radar_enabled=True, radar_distance_m=20)
+    assert emergency == {"throttle": 0., "rudder_deg": 0., "override": "radar_emergency"}
+    assert executor.update(radar_enabled=False, radar_distance_m=19)["override"] is None
 
 def test_metrics():
     assert .69 < wilson(41,50)[0] < .70

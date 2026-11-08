@@ -1,4 +1,5 @@
 import math
+from collections import defaultdict
 import torch
 
 def summarize_confusion(matrix):
@@ -15,6 +16,38 @@ def classification_counts(logits, targets):
     top = logits.topk(3, -1).indices
     return {"samples": len(targets), "top1_correct": int((top[:, 0] == targets).sum()),
             "top3_correct": int((top == targets[:, None]).any(1).sum())}
+
+def episode_accuracy(predictions):
+    episodes = {}
+    for row in predictions:
+        episode = episodes.setdefault(row["episode_id"], {"task": row["task"], "samples": 0,
+                                                           "top1_correct": 0, "top3_correct": 0})
+        if episode["task"] != row["task"]:
+            raise ValueError("An episode cannot span tasks")
+        episode["samples"] += 1
+        episode["top1_correct"] += int(row["target"] == row["top3"][0])
+        episode["top3_correct"] += int(row["target"] in row["top3"])
+    for episode in episodes.values():
+        for key in ("top1", "top3"):
+            episode[key] = episode[key + "_correct"] / episode["samples"]
+
+    def aggregate(group):
+        samples = sum(e["samples"] for e in group)
+        result = {"episodes": len(group), "samples": samples}
+        for key in ("top1", "top3"):
+            hits = sum(e[key + "_correct"] for e in group)
+            result[key] = sum(e[key] for e in group) / len(group)
+            result[key + "_correct"] = hits
+            result["sample_" + key] = hits / samples
+        return result
+
+    if not episodes:
+        raise ValueError("No evaluated episodes")
+    tasks = defaultdict(list)
+    for episode in episodes.values():
+        tasks[episode["task"]].append(episode)
+    return {**aggregate(list(episodes.values())), "accuracy_aggregation": "episode_macro",
+            "by_task": {task: aggregate(group) for task, group in tasks.items()}, "by_episode": episodes}
 
 def binary_auc(scores, labels):
     """Rank AUC with ties; null when one class is absent (never fake 0.5)."""
